@@ -59,6 +59,9 @@ Diff.Structure (assembly)
 ├── TableStructureComparisonResult    // output (serializes to the report JSON)
 ├── IMetadataProvider                 // metadata-reading contract
 ├── MsSqlMetadataProvider             // IMetadataProvider implementation for MS SQL Server
+├── MsSqlMetadataQueryBuilder         // composes the MS SQL metadata queries from the options
+├── DatabaseOptions                   // engine-neutral database options (collation)
+├── MsSqlDatabaseOptions              // + MS SQL capabilities (ledger tables)
 ├── CollationInfo                     // a database's collation and its comparison flags
 ├── INameComparerResolver             // identifier-comparison rule contract
 ├── MsSqlNameComparerResolver         // collation -> StringComparer for MS SQL Server
@@ -75,6 +78,10 @@ the neutral half.
 ```
 
 **Separation of concerns (hard requirement).** `TableStructureComparer` never touches ADO.NET, never opens a connection and never executes SQL. All metadata retrieval is delegated to `IMetadataProvider`. This keeps the comparison logic pure, makes it unit-testable against a fake provider, and allows providers for other engines to be added later without touching the comparer.
+
+The comparer holds no SQL either, and never sees any: `MsSqlMetadataQueryBuilder` is created and used entirely inside `MsSqlMetadataProvider` (§3.4.1) and is invisible above it. The one thing the comparer carries between provider calls is the `DatabaseOptions` object of §3.3.1 — an opaque description of a database, not a statement. It never inspects that object beyond `Collation`, and never downcasts it, so it stays engine-neutral even though the object it passes around may be an MS SQL one.
+
+**A second split, inside the provider.** SQL text is composed by `MsSqlMetadataQueryBuilder` (§3.4.3) and executed by `MsSqlMetadataProvider` (§3.4.1). The two concerns are genuinely different: what to say to a database is a pure function of what that database supports, while how to say it is connections, parameters and readers. Separating them lets the first be unit-tested by asserting on a string, with no server of any version present — which is the whole reason the split exists, since the capability the queries branch on differs between SQL Server versions and the wrong branch fails at parse time rather than at run time (§3.4.3).
 
 **Dependencies.** `Microsoft.Data.SqlClient` (referenced only by `MsSqlMetadataProvider`) and `System.Text.Json`. No other third-party dependencies.
 
@@ -123,7 +130,8 @@ public sealed class TableStructureComparer
 
 - The comparer takes two collaborators and owns neither concern itself: `IMetadataProvider` reads the schema (§3.3.1), `INameComparerResolver` decides how identifiers are compared (§3.3.2). Both are interfaces, so a unit test drives the whole algorithm with two fakes and no SQL Server.
 - The constructor throws `ArgumentNullException` when either `metadataProvider` or `nameComparerResolver` is `null`.
-- The class is stateless and therefore thread-safe: a single instance may serve concurrent calls, including runs against different databases with different collations.
+- The comparer takes no options object of its own. It reads the two `DatabaseOptions` itself as the first step of a run (§6.1) and threads each side's object through that side's subsequent provider calls; they are locals of the call, never fields, and never reach the constructor.
+- The class is stateless and therefore thread-safe: a single instance may serve concurrent calls, including runs against different databases with different collations — and, since the options travel as arguments rather than as cached state, against databases of different server versions.
 
 ### 3.3.1 `IMetadataProvider`
 
@@ -132,36 +140,72 @@ The interface declares the contract for every operation needed to read MS SQL me
 ```csharp
 public interface IMetadataProvider
 {
-    /// <summary>Returns the collation of the database — its name plus the properties
-    /// a comparer is built from (§3.3.2).</summary>
-    Task<CollationInfo> GetDatabaseCollationAsync(
+    /// <summary>Returns the options of the database — its collation (§3.3.2) plus whatever
+    /// else this provider needs to know about the server before it reads any metadata.
+    /// An engine-specific provider returns its own derived type; for MS SQL that is
+    /// <see cref="MsSqlDatabaseOptions"/>.</summary>
+    Task<DatabaseOptions> GetDatabaseOptionsAsync(
         string connectionString,
         CancellationToken cancellationToken = default);
 
     /// <summary>Returns all user tables of the database.</summary>
     Task<IReadOnlyCollection<TableIdentity>> GetTablesAsync(
         string connectionString,
+        DatabaseOptions databaseOptions,
         CancellationToken cancellationToken = default);
 
     /// <summary>Returns the fields of the specified tables.</summary>
     Task<IReadOnlyCollection<FieldMetadata>> GetFieldsAsync(
         string connectionString,
+        DatabaseOptions databaseOptions,
         IReadOnlyCollection<TableIdentity> tables,
         CancellationToken cancellationToken = default);
 
     /// <summary>Returns the primary keys of the specified tables (zero or one per table).</summary>
     Task<IReadOnlyCollection<PrimaryKeyMetadata>> GetPrimaryKeysAsync(
         string connectionString,
+        DatabaseOptions databaseOptions,
         IReadOnlyCollection<TableIdentity> tables,
         CancellationToken cancellationToken = default);
 
     /// <summary>Returns the foreign keys declared on the specified tables.</summary>
     Task<IReadOnlyCollection<ForeignKeyMetadata>> GetForeignKeysAsync(
         string connectionString,
+        DatabaseOptions databaseOptions,
         IReadOnlyCollection<TableIdentity> tables,
         CancellationToken cancellationToken = default);
 }
 ```
+
+`GetDatabaseOptionsAsync` is the run's single preliminary read, and it answers two questions in one round trip: how the database compares identifiers, and what the database supports. The first is the collation, reached as `DatabaseOptions.Collation` — the only path to it, since the interface declares no separate collation-reading method. The second is whatever the implementation must know before it can decide what its metadata queries may say (§3.4.1).
+
+Every metadata method then takes that same object back as `databaseOptions`. It is not decoration: for MS SQL the statement a database gets depends on what that database supports, and this parameter is how the answer reaches the code that composes it. Reading the options once, up front, and passing them to each of the four calls means the capability is established in a single round trip and consulted four times for free — the alternative, re-reading it per call, would take a comparison from five queries per database to nine (§9).
+
+Passing the options explicitly rather than letting a provider cache them is also what keeps implementations stateless and keeps a comparison honest: the object describes the database *as read at the start of this run*, so two runs against the same connection string are never silently served from one another's answer, and a provider need hold nothing — least of all a connection string — between calls.
+
+**Database options.** What `GetDatabaseOptionsAsync` returns is an open, extensible carrier rather than a sealed record, because each engine has a different set of things worth knowing before it reads a catalog:
+
+```csharp
+//file DatabaseOptions.cs
+public class DatabaseOptions
+{
+    /// <summary>The collation of the database — its name plus the properties
+    /// a comparer is built from (§3.3.2).</summary>
+    public CollationInfo Collation { get; init; }
+}
+//file MsSqlDatabaseOptions.cs
+public sealed class MsSqlDatabaseOptions : DatabaseOptions
+{
+    /// <summary>True when sys.tables exposes the ledger columns — that is, when the
+    /// server knows about ledger tables at all (SQL Server 2022+ / Azure SQL Database).</summary>
+    public bool SupportsLedgerTables { get; init; }
+}
+```
+
+- `DatabaseOptions` carries only what every engine has: the collation. It is a plain `class` — not a `record`, not `sealed` — precisely so that a provider can extend it. Equality is never taken on it, so record semantics would buy nothing. Its properties are `init`-only: the options describe a database as it was read and are never mutated afterwards.
+- `MsSqlDatabaseOptions` adds the one MS SQL capability the metadata queries depend on. `SupportsLedgerTables` is a **capability** flag, not a version number, and deliberately not derived from `SERVERPROPERTY('ProductMajorVersion')`: Azure SQL Database supports ledger while still reporting major version `12`, so a version comparison would disable the ledger filter on exactly the platform where ledger tables are most likely to be found. It is answered by asking the catalog whether the column is there (§3.4.1).
+- The base type is what travels through the engine-neutral parts of the library. `INameComparerResolver` and §6.1's mismatch check read `Collation` and nothing else; `TableStructureComparer` reads `Collation` and otherwise treats the object as opaque, passing it from one provider call to the next without ever downcasting. The downcast happens in exactly one place — the provider that produced the object (§3.4.1).
+- Adding a second capability later means one more property here and one more branch in `MsSqlMetadataQueryBuilder`; neither `IMetadataProvider`, nor the comparer, nor any other engine's implementation changes. That is the point of putting the flag in the options object rather than in a method signature.
 
 Supporting metadata types (immutable records):
 
@@ -366,6 +410,10 @@ There is no ambient default and no process-wide current policy: `NameIdentity` a
 - `PrimaryKeyMetadata.Fields` and `ForeignKeyMetadata.Columns` are **ordered sequences**, not sets: the provider passes the participating fields in key order (`key_ordinal` for a primary key, `constraint_column_id` for a foreign key), because the report renders them in that order (§5). Set semantics belong to the comparison, not to the metadata: §6.4 and §6.5 compare these sequences as sets under the comparer detected in §6.1. A provider must not pass a hash-set type here — doing so would both lose the key order and hard-code an equality rule that §6.1 reserves for the collation.
 - The provider supplies every identifier as a plain `string`; the metadata records wrap it in a `NameIdentity` themselves, under the `QuotesUsage` and `QuoteInfo` of the owning `TableIdentity`. A provider therefore never constructs a `NameIdentity` and never chooses a quoting policy.
 - The `tables` argument narrows the result set. Passing an empty collection returns an empty result without hitting the database.
+- `GetDatabaseOptionsAsync` never returns `null`, and `DatabaseOptions.Collation` is never `null`. A provider with engine-specific options to report returns its own derived type; one with none may return a `DatabaseOptions` directly.
+- The `databaseOptions` handed to a metadata method must be the object **this same provider** returned from `GetDatabaseOptionsAsync` for **this same** `connectionString`. Passing the other side's options is a caller error the provider cannot always detect, and §6.1 places the obligation on the comparer accordingly. A `null` throws `ArgumentNullException`; an instance of a type the provider does not recognise throws `ArgumentException` (§3.4.1).
+- A provider must never paper over a missing or foreign options object by re-reading the database or by assuming default capabilities. A silently degraded query is exactly the failure this parameter exists to prevent.
+- Implementations are **stateless** with respect to a database: nothing is cached between calls — not options, not connections, not query text — and in particular nothing is keyed by connection string. Everything a call needs arrives in its arguments.
 - Every method honours `cancellationToken` and propagates `OperationCanceledException`.
 - Implementations must be safe to call concurrently for the two connection strings.
 ### 3.3.2 `INameComparerResolver`
@@ -410,41 +458,66 @@ The `ComparisonStyle` bits map one-to-one onto `System.Globalization.CompareOpti
 
 Contract rules:
 
-- The resolver is a **pure mapping** from a collation to a comparer, and its signature says so: no `Task`, no `CancellationToken`. It opens no connection and reads no metadata — the caller has already obtained the `CollationInfo` from `IMetadataProvider.GetDatabaseCollationAsync`. This is the one place in the library that is deliberately synchronous: there is nothing to await, and wrapping a table lookup in a `Task` would only add an allocation and hide that fact from the caller.
+- The resolver is a **pure mapping** from a collation to a comparer, and its signature says so: no `Task`, no `CancellationToken`. It opens no connection and reads no metadata — the caller has already obtained the `CollationInfo` as `DatabaseOptions.Collation` from `IMetadataProvider.GetDatabaseOptionsAsync`. This is the one place in the library that is deliberately synchronous: there is nothing to await, and wrapping a table lookup in a `Task` would only add an allocation and hide that fact from the caller.
 - The mapping must be **total and deterministic** for the collations it accepts: the same `CollationInfo` always yields an equivalent comparer, and an unsupported one throws rather than degrades (§3.4.2).
 - Implementations never return `null`.
 - Keeping this separate from `IMetadataProvider` is what lets a test pin the comparison rule without standing up any metadata at all, and lets a caller override the rule for a collation the built-in mapping handles poorly.
 
 ### 3.4.1 `MsSqlMetadataProvider`
 
-An `IMetadataProvider` implementation on top of `Microsoft.Data.SqlClient` that reads the `sys.*` catalog views. One `SqlConnection` per call, opened with `OpenAsync(ct)` and read with `ExecuteReaderAsync(ct)` / `ReadAsync(ct)`. No synchronous ADO.NET calls anywhere.
+```csharp
+public sealed class MsSqlMetadataProvider : IMetadataProvider
+{
+    private readonly MsSqlMetadataQueryBuilder _queryBuilder;
 
-Selection rule: user tables only — `sys.tables` with `type = 'U'` and `is_ms_shipped = 0`; system schemas (`sys`, `INFORMATION_SCHEMA`) are excluded. On top of that the provider drops the engine-generated shadow tables named in §1.3 — temporal history tables (`temporal_type = 1`), ledger history tables (`ledger_type = 1`) and the retained remains of dropped ledger tables (`is_dropped_ledger_table = 1`). The filter is applied in the provider, not in the comparer, and it is not configurable: these tables are absent from every collection `IMetadataProvider` returns, so no downstream code has to know they exist.
-
-Two of those columns — `ledger_type` and `is_dropped_ledger_table` — exist only on SQL Server 2022 (major version 16) and later. Referencing a column that does not exist is a **parse-time** failure, not a runtime one, so the predicate cannot simply be written into a static statement and left to evaluate harmlessly on an older server. Each of the four metadata statements is therefore sent as a short batch that probes for the column, appends the two predicates only when it is there, and executes the composed text through `sys.sp_executesql`:
-
-```sql
-DECLARE @shadow nvarchar(200) = N' AND t.temporal_type <> 1';
-IF COL_LENGTH(N'sys.tables', N'ledger_type') IS NOT NULL
-    SET @shadow += N' AND t.ledger_type <> 1 AND t.is_dropped_ledger_table = 0';
-EXEC sys.sp_executesql (@baseQuery + @shadow);
+    public MsSqlMetadataProvider()
+    {
+        this._queryBuilder = new MsSqlMetadataQueryBuilder();
+    }
+}
 ```
 
-The batch is still **one** round trip, so §9's five-query budget is unchanged; the probe costs no extra call and the provider stays stateless, since nothing is carried between calls. `temporal_type` needs no probe — it has been present since SQL Server 2016, the library's minimum.
+An `IMetadataProvider` implementation on top of `Microsoft.Data.SqlClient` that reads the `sys.*` catalog views. One `SqlConnection` per call, opened with `OpenAsync(ct)` and read with `ExecuteReaderAsync(ct)` / `ReadAsync(ct)`. No synchronous ADO.NET calls anywhere.
 
-The probe is deliberately a **capability** check rather than a version check. Azure SQL Database supports ledger while still reporting `SERVERPROPERTY('ProductMajorVersion')` as `12`, so a version comparison would silently disable the filter on exactly the platform where ledger tables are most likely to be found.
+The provider owns exactly one SQL literal of its own — the database-options statement below. Each of the four metadata methods asks `_queryBuilder` (§3.4.3) for its statement, passing the `databaseOptions` it was given, and then does what a provider is actually for: open the connection, bind the parameters, run the reader, shape the rows into records, normalize the types.
 
-Reference queries:
+```csharp
+var msSqlOptions = AsMsSqlOptions(databaseOptions);                     // the checked narrowing below
+var query = this._queryBuilder.BuildTableMetadataQuery(msSqlOptions);   // and so on for the other three
+```
+
+The builder is created in the constructor rather than injected, which is what keeps the provider constructible as a bare `new MsSqlMetadataProvider()` (§12). It is stateless and holds nothing, so one instance per provider costs nothing and the provider remains stateless with it. The consequence to be aware of is that the query text is fixed at compile time: it cannot be substituted from outside, and a unit test cannot stub it — the builder is instead tested directly (§10), which is cheap because it needs no database.
+
+**The one downcast in the library.** The interface hands over a `DatabaseOptions`; the builder requires an `MsSqlDatabaseOptions`. Each of the four metadata methods therefore narrows the argument before using it, and the narrowing is checked:
+
+- `null` throws `ArgumentNullException`.
+- Any runtime type other than `MsSqlDatabaseOptions` throws `ArgumentException` naming both the expected and the actual type. This is what a provider/options mix-up looks like, and it must fail loudly: the provider does not fall back to re-reading the options itself, nor to assuming `SupportsLedgerTables = false`, because both would replace a visible composition error with a silently wrong or silently expensive run.
+- In practice the object is the one this provider returned from its own `GetDatabaseOptionsAsync` for the same connection string, which is what §3.3.1 requires of the caller and §6.1 of the comparer.
+
+Selection rule: user tables only — `sys.tables` with `type = 'U'` and `is_ms_shipped = 0`; system schemas (`sys`, `INFORMATION_SCHEMA`) are excluded. On top of that the provider drops the engine-generated shadow tables named in §1.3 — temporal history tables (`temporal_type = 1`), ledger history tables (`ledger_type = 1`) and the retained remains of dropped ledger tables (`is_dropped_ledger_table = 1`). The filter lives in the metadata queries — composed by the builder (§3.4.3), executed by the provider — and never in the comparer; it is not configurable through `TableStructureComparisonOptions`. These tables are absent from every collection `IMetadataProvider` returns, so no downstream code has to know they exist.
+
+Two of those columns — `ledger_type` and `is_dropped_ledger_table` — exist only on SQL Server 2022 (major version 16) and later, and referencing a column that does not exist is a **parse-time** failure in T-SQL, not a runtime one. A predicate left in a static statement "to evaluate harmlessly" on an older server therefore does not evaluate at all: the whole batch fails before it runs. Which of the two variants of a query a database gets is consequently a real decision, and §3.4.3 is where it is made — from `MsSqlDatabaseOptions.SupportsLedgerTables`, in C#, ahead of execution. No metadata statement probes the server about itself, composes its own text, or passes through `sys.sp_executesql`: each arrives from the builder as finished, static SQL, already correct for the server it is about to run on.
+
+`temporal_type` needs no capability behind it — it has been present since SQL Server 2016, the library's minimum — so its predicate is unconditional in both variants.
+
+**Database options.** The one statement the provider owns, and the one that cannot come from the builder, since it is what tells the builder which queries to produce. A single round trip answers both halves of the question — how this database compares identifiers, and what its `sys.tables` exposes:
 
 ```sql
--- Database collation
 DECLARE @collation sysname = CONVERT(sysname, DATABASEPROPERTYEX(DB_NAME(), 'Collation'));
 SELECT @collation                                        AS Name,
        COLLATIONPROPERTY(@collation, 'LCID')             AS Lcid,
        COLLATIONPROPERTY(@collation, 'CodePage')         AS CodePage,
        COLLATIONPROPERTY(@collation, 'ComparisonStyle')  AS ComparisonStyle,
-       COLLATIONPROPERTY(@collation, 'Version')          AS Version;
+       COLLATIONPROPERTY(@collation, 'Version')          AS Version,
+       CAST(IIF(COL_LENGTH(N'sys.tables', N'ledger_type') IS NULL, 0, 1) AS BIT)
+                                                         AS SupportsLedgerTables;
+```
 
+`GetDatabaseOptionsAsync` returns an `MsSqlDatabaseOptions`: the first five columns become `Collation`, the sixth becomes `SupportsLedgerTables`. `COL_LENGTH` is a **capability** check rather than a version check, for the Azure SQL reason given in §3.3.1. Asking it here — once, as a column of a query that has to run anyway — is what makes the capability free: it rides along inside the one preliminary read, so the five-query budget of §9 pays nothing for it.
+
+**Reference queries.** The four below are the builder's, reproduced from §3.4.3 in their `SupportsLedgerTables = true` form. What the provider fixes about them is the reader contract — the columns each projects, in the order its reader expects; a builder may change a `WHERE` clause freely, but changing a projection breaks the provider.
+
+```sql
 -- Tables
 SELECT s.name AS SchemaName, t.name AS TableName
 FROM sys.tables t
@@ -498,7 +571,9 @@ WHERE t.is_ms_shipped = 0
   AND t.ledger_type <> 1 AND t.is_dropped_ledger_table = 0;
 ```
 
-The shadow-table predicates are shown above in their SQL Server 2022 form; on an earlier server the two `ledger_*` lines are the ones the `COL_LENGTH` probe omits.
+On a database whose `SupportsLedgerTables` is `false`, the two `ledger_*` lines are absent from the emitted text entirely rather than merely inert — see §3.4.3 for why the distinction matters.
+
+The `tables` argument narrows the three table-restricted queries exactly as before; the provider binds the restriction as a parameter and never splices a caller-supplied name into the statement as text. It is orthogonal to the ledger branch: both variants of each query accept it.
 
 **Type normalization performed by the provider**, so that the comparer receives already-comparable values:
 
@@ -542,6 +617,104 @@ return CultureInfo.GetCultureInfo(collation.Lcid)
 
 **What this reproduces, and what it does not.** The four ignore-flags cover case, accent, kana and width, which is what decides whether two identifiers are the *same* identifier — the question this library actually asks. It does not reproduce SQL Server's *sort order* exactly: .NET orders through ICU, SQL Server through its own tables, and the legacy `SQL_*` collations use sort orders that predate Windows collations altogether. That is why the report's ordering does not depend on this comparer (§4), and why an exact ordering match is listed as an open question (§11).
 
+### 3.4.3 `MsSqlMetadataQueryBuilder`
+
+```csharp
+public sealed class MsSqlMetadataQueryBuilder
+{
+    public string BuildTableMetadataQuery(MsSqlDatabaseOptions options);
+    public string BuildFieldMetadataQuery(MsSqlDatabaseOptions options);
+    public string BuildPrimaryKeyMetadataQuery(MsSqlDatabaseOptions options);
+    public string BuildForeignKeyMetadataQuery(MsSqlDatabaseOptions options);
+}
+```
+
+The other half of the pair `MsSqlMetadataProvider` forms (§3.4.1): the provider knows *how to talk to* a database, the builder knows *what to say to it*. It touches no database — everything it needs to decide has already been read into the `MsSqlDatabaseOptions` it receives.
+
+It is a concrete `sealed` class rather than an interface, and it takes `MsSqlDatabaseOptions` rather than the base type. Both follow from what it is: the MS SQL half of an MS SQL provider, useful only to that provider, with nothing for another engine to implement. The typed parameter is what makes the capability available without a runtime type test inside the builder — the one check the design does need happens once, at the provider's boundary (§3.4.1), where a wrong options object is a caller error worth naming. A builder for another engine would take that engine's options type and live beside this one, not behind a shared abstraction.
+
+**The one decision it makes.** From `options.SupportsLedgerTables` it emits one of two variants of each query:
+
+| `SupportsLedgerTables` | What the query contains |
+| --- | --- |
+| `true` | the ledger predicates — `t.ledger_type <> 1 AND t.is_dropped_ledger_table = 0` — so ledger history tables and the retained remains of dropped ledger tables are **filtered out** of the result |
+| `false` | no mention of ledger at all: neither column is named anywhere in the returned text |
+
+The `false` branch is a correctness requirement, not an optimization. Both columns are SQL Server 2022+ (§3.4.1), and naming a column that does not exist fails at parse time — so the two variants must differ in what the text *mentions*, not merely in what it *matches*. A predicate that would be false-by-construction on an old server is still fatal there, which is why "emit it and let it be ignored" is not an option and why the branch has to be taken in C#.
+
+`t.temporal_type <> 1` is unconditional: present in all four queries and in both variants.
+
+Reference queries, in the `SupportsLedgerTables = true` form. In the `false` form every line marked `-- ledger` is absent from the emitted text; nothing else differs, and the projection in particular is identical:
+
+```sql
+-- BuildTableMetadataQuery
+SELECT s.name AS SchemaName, t.name AS TableName
+FROM sys.tables t
+JOIN sys.schemas s ON s.schema_id = t.schema_id
+WHERE t.type = 'U' AND t.is_ms_shipped = 0
+  AND t.temporal_type <> 1                 -- temporal history table
+  AND t.ledger_type <> 1                   -- ledger: ledger history table
+  AND t.is_dropped_ledger_table = 0;       -- ledger: remains of a dropped one
+
+-- BuildFieldMetadataQuery
+SELECT s.name, t.name, c.name, ty.name AS DataType,
+       c.max_length, c.precision, c.scale, c.is_nullable
+FROM sys.columns c
+JOIN sys.tables   t  ON t.object_id     = c.object_id
+JOIN sys.schemas  s  ON s.schema_id     = t.schema_id
+JOIN sys.types    ty ON ty.user_type_id = c.user_type_id
+WHERE t.type = 'U' AND t.is_ms_shipped = 0
+  AND t.temporal_type <> 1
+  AND t.ledger_type <> 1                   -- ledger
+  AND t.is_dropped_ledger_table = 0;       -- ledger
+
+-- BuildPrimaryKeyMetadataQuery
+SELECT s.name, t.name, kc.name AS KeyName, c.name AS ColumnName, ic.key_ordinal
+FROM sys.key_constraints kc
+JOIN sys.tables        t  ON t.object_id  = kc.parent_object_id
+JOIN sys.schemas       s  ON s.schema_id  = t.schema_id
+JOIN sys.index_columns ic ON ic.object_id = kc.parent_object_id
+                         AND ic.index_id  = kc.unique_index_id
+JOIN sys.columns       c  ON c.object_id  = ic.object_id
+                         AND c.column_id  = ic.column_id
+WHERE kc.type = 'PK' AND t.is_ms_shipped = 0
+  AND t.temporal_type <> 1
+  AND t.ledger_type <> 1                   -- ledger
+  AND t.is_dropped_ledger_table = 0;       -- ledger
+
+-- BuildForeignKeyMetadataQuery
+SELECT s.name  AS SchemaName,    t.name  AS TableName,    fk.name AS KeyName,
+       rs.name AS RefSchemaName, rt.name AS RefTableName,
+       pc.name AS ColumnName,    rc.name AS RefColumnName,
+       fkc.constraint_column_id
+FROM sys.foreign_keys fk
+JOIN sys.tables  t  ON t.object_id  = fk.parent_object_id
+JOIN sys.schemas s  ON s.schema_id  = t.schema_id
+JOIN sys.tables  rt ON rt.object_id = fk.referenced_object_id
+JOIN sys.schemas rs ON rs.schema_id = rt.schema_id
+JOIN sys.foreign_key_columns fkc ON fkc.constraint_object_id = fk.object_id
+JOIN sys.columns pc ON pc.object_id = fkc.parent_object_id
+                   AND pc.column_id = fkc.parent_column_id
+JOIN sys.columns rc ON rc.object_id = fkc.referenced_object_id
+                   AND rc.column_id = fkc.referenced_column_id
+WHERE t.is_ms_shipped = 0
+  AND t.temporal_type <> 1
+  AND t.ledger_type <> 1                   -- ledger
+  AND t.is_dropped_ledger_table = 0;       -- ledger
+```
+
+The shadow-table predicates apply to the declaring table `t` only. A foreign key's **referenced** table is deliberately not filtered by them, nor by the `tables` restriction of §3.4.1: a compared table may legitimately reference a table outside the comparison set, and dropping such a key would report a difference that does not exist.
+
+Contract rules:
+
+- The builder is a **pure function** of `options`: no `Task`, no `CancellationToken`, no connection string, no I/O. Given the same options it returns the same text, which is what lets a test assert on that text directly (§10).
+- It never returns `null` or an empty string. A `null` `options` throws `ArgumentNullException`.
+- Every returned statement is complete and executable as-is. The builder never embeds an identifier or a literal taken from user input; the `tables` restriction reaches the server as a bound parameter (§3.4.1), and the only thing that varies between the two variants is the ledger predicates.
+- The projection of each query is the contract with the provider's readers (§3.4.1) and is identical in both variants.
+- The builder is stateless and safe for concurrent use. The right SQL is computed on each call in accordance with the specified database options.
+- Nothing is cached because nothing can be: the text depends on `options`, so there is no single value to build once. Any build-once scheme would need a key, and a wrongly-keyed one hands a 2022 statement to a 2019 server — the parse-time failure this whole branch exists to avoid. Composing it costs a branch on a `bool`, which is why there is nothing to amortize. Contrast the report's `JsonSerializerOptions` (§4), whose configuration depends on nothing and is therefore built once and reused; the two rules point in opposite directions for that reason, not by oversight.
+- Nothing requires the two sides of one comparison to receive the same text. A left database on SQL Server 2019 and a right one on 2022 report different capabilities and legitimately get different variants — §6.1 checks the collation for a mismatch, never the capabilities.
+
 ---
 
 ## 4. Result model
@@ -569,7 +742,7 @@ public static class ObjectExtensions
 Requirements for the extension:
 
 - When `options` is omitted, the method applies the library's default `JsonSerializerOptions` — the camelCase naming policy and `JsonIgnoreCondition.WhenWritingNull` listed above — so that `result.ToJson()` alone produces a report conforming to §5. When `options` is supplied it is used verbatim, and honouring the rules above becomes the caller's responsibility.
-- The defaults are built once into a cached static `JsonSerializerOptions` instance; the object is never rebuilt per call.
+- The defaults are built once into a cached static `JsonSerializerOptions` instance; the object is never rebuilt per call. This is not a micro-optimization and not a stylistic preference: a `JsonSerializerOptions` instance caches the per-type serialization metadata it derives on first use — converters, property accessors, write order — and becomes effectively immutable afterwards. A fresh instance per call discards that cache and re-derives it through reflection every time, which costs orders of magnitude rather than percent. The rule therefore holds specifically because the configuration depends on nothing; where a value does depend on its input, it is composed per call instead (§3.4.3).
 - The body is a straight delegation — `JsonSerializer.Serialize(value, options)`. Although the parameter is declared as `object`, `System.Text.Json` resolves the value's runtime type and writes the full object graph, so no `value.GetType()` overload is required.
 - `value` being `null` throws `ArgumentNullException`.
 - The type is `public static` and lives in the library's root namespace, so `using Diff.Structure;` is all a consumer needs.
@@ -670,14 +843,17 @@ Requirements for the extension:
 
 ## 6. Comparison algorithm
 
-### 6.1 Collation check and comparer detection
+### 6.1 Database options, collation check and comparer detection
 
 Identifier comparison follows the collation of the databases being compared; there is no fixed rule. Before any structural work begins:
 
-1. Read the `CollationInfo` of both databases through `IMetadataProvider.GetDatabaseCollationAsync`, concurrently for the two sides.
-2. Compare the two collations. **If they differ, throw `CollationMismatchException` carrying both names and stop.** No further metadata is read and no report is produced: when the two databases disagree on identifier equality there is no defensible answer to whether `dbo.Orders` on one side denotes the same object as `dbo.orders` on the other. Equality is decided on the whole record, not on `Name` alone — two collations of the same name but different `Version` sort differently and are not interchangeable.
+1. Read the `DatabaseOptions` of both databases through `IMetadataProvider.GetDatabaseOptionsAsync`, concurrently for the two sides. This is the run's only preliminary round trip per side, and it answers two independent questions at once: how the database compares identifiers (`Collation`, used in steps 2–4) and what the provider may say to it when reading metadata (§3.4.1, used from §6.2 on).
+2. Compare the two collations — `left.Collation` against `right.Collation`. **If they differ, throw `CollationMismatchException` carrying both names and stop.** No further metadata is read and no report is produced: when the two databases disagree on identifier equality there is no defensible answer to whether `dbo.Orders` on one side denotes the same object as `dbo.orders` on the other. Equality is decided on the whole `CollationInfo` record, not on `Name` alone — two collations of the same name but different `Version` sort differently and are not interchangeable. **Only the collation is compared.** Engine capabilities are not, and a difference in them is not an error: two servers of different versions may legitimately be compared, and §3.4.3 handles that by building each side's queries from that side's own options.
 3. Hand the agreed `CollationInfo` to `INameComparerResolver.ResolveNameComparer` (§3.3.2). The call is synchronous because the mapping is pure arithmetic over the record — it touches no database and cannot block. For MS SQL it turns the collation's ignore-flags into `CompareOptions` and asks the culture named by `Lcid` for a comparer (§3.4.2).
 4. The returned instance is the single `StringComparer` used for every schema, table, field and key name for the rest of the run. It is resolved once per call and passed down into §6.2–§6.6. No code path may fall back to a hard-coded comparer.
+5. Keep both `DatabaseOptions` objects for the rest of the call. Every subsequent provider call takes the object belonging to **its own** side, and the comparer is what guarantees the pairing: nothing in the type system stops the left options from being handed to a call against the right connection string, and on two servers of different versions that mistake produces a statement the target cannot parse. Pair them at the point where the two sides are already paired — the `Task.WhenAll` of §6.2 — rather than passing one shared object.
+
+Both options objects, like the resolved comparer, are locals of the one `CompareTableStructureAsync` call. Nothing is cached across calls and nothing is stored on the comparer, which is what keeps it stateless and safe for concurrent runs (§3.2). The comparer reads `Collation` and treats the rest of the object as opaque: it never inspects a capability and never downcasts to `MsSqlDatabaseOptions`.
 
 Consequences the implementation must respect:
 
@@ -687,14 +863,14 @@ Consequences the implementation must respect:
 
 ### 6.2 Building the table sets
 
-1. Fetch the tables of both databases concurrently (`Task.WhenAll` over the two `GetTablesAsync` calls).
+1. Fetch the tables of both databases concurrently (`Task.WhenAll` over the two `GetTablesAsync` calls), each passing that side's own `DatabaseOptions` from §6.1.
 2. `tables.detected` = the distinct union of the left and right table names, compared with the detected comparer.
 3. `tables.unchecked` = `detected ∩ options.UserExcludedTables`, matched on the bare two-part name with the comparer of §6.1.
 4. `tables.ignored.left` = tables present in the **left** database, not excluded by the user, and **absent in the right** one. `tables.ignored.right` is the mirror image.
 5. Comparison set = `detected − unchecked − ignored.left − ignored.right`.
 6. A table that exists only in the left database is reported in `missings.right.tables`; a table that exists only in the right database is reported in `missings.left.tables`.
 7. A table listed in `tables.unchecked` is never reported as missing or inconsistent, even when it exists in one database only.
-8. Fields, primary keys and foreign keys are then fetched for the comparison set only, again concurrently for the two databases.
+8. Fields, primary keys and foreign keys are then fetched for the comparison set only, again concurrently for the two databases, each call passing that side's `DatabaseOptions` alongside the comparison set. An empty comparison set short-circuits in the provider, which §3.3.1 requires to return empty without touching the database.
 
 ### 6.3 Field comparison
 
@@ -785,7 +961,8 @@ Additional required regression cases:
 ## 8. Error handling, cancellation, safety
 
 - **Argument validation.** A `null` `options` value, or a `null`/empty connection string on either side, throws `ArgumentNullException` / `ArgumentException` synchronously, before any I/O starts.
-- **Collation mismatch.** When the two databases do not share the same collation, `CollationMismatchException` is thrown (§6.1). It carries both collation names and reports which side had which. It is raised before any table metadata is read, so the call fails fast and returns no partial report.
+- **Collation mismatch.** When the two databases do not share the same collation, `CollationMismatchException` is thrown (§6.1). It carries both collation names and reports which side had which. It is raised before any table metadata is read — though after `GetDatabaseOptionsAsync` has answered for both sides, since that call is what supplies the collations — so the call fails fast and returns no partial report. A difference in engine **capabilities** is not a mismatch and never fails the call.
+- **Wrong or missing options object.** `MsSqlMetadataProvider` throws `ArgumentException` when a metadata call receives a `DatabaseOptions` that is not an `MsSqlDatabaseOptions`, and `ArgumentNullException` when it receives none (§3.4.1). This is a composition error rather than a data error: it surfaces before any query is built or executed, and must not be caught and degraded into a query built on assumed capabilities.
 - **Connectivity and permission failures.** A `SqlException` raised while reading metadata is wrapped in a dedicated `MetadataAccessException` that carries the affected side (`Left` / `Right`) and the original exception as `InnerException`. A partial report is never returned — a failure on either side fails the whole call.
 - **Cancellation.** `cancellationToken` is threaded through every provider call and every ADO.NET call. Cancellation surfaces as `OperationCanceledException`; no partial result is produced.
 - **Read-only guarantee.** The library issues `SELECT` statements against catalog views only. Callers are advised to use a login that has `VIEW DEFINITION` and no write permissions.
@@ -795,7 +972,7 @@ Additional required regression cases:
 
 ## 9. Non-functional requirements
 
-- **Round trips.** Exactly five queries per database (collation, tables, fields, primary keys, foreign keys). No per-table queries. The collation query runs first and gates the other four; resolving the comparer from it costs no round trip at all, since `INameComparerResolver` is a pure mapping. The four metadata statements are sent as self-composing batches so that the shadow-table capability probe of §3.4.1 rides along inside them — the count of five stands.
+- **Round trips.** Exactly five queries per database (database options, tables, fields, primary keys, foreign keys). No per-table queries. The options query runs first and gates the other four: it supplies both the collation the comparer is resolved from and the capability the four statements are built from. Neither resolving the comparer nor building a query costs a round trip — `INameComparerResolver` and `MsSqlMetadataQueryBuilder` are both pure, in-process mappings. The ledger capability rides along as a column of the options query rather than being probed by the metadata statements themselves, which is what lets those four be plain static SQL and still keeps the count at five. Passing the options into each metadata call, rather than having the provider re-read them, is what stops that count from becoming nine.
 - **Parallelism.** Left and right metadata are read concurrently.
 - **Throughput target.** A pair of databases with 1,000 tables and 20,000 columns is compared in under 10 seconds over a LAN, excluding SQL Server response time.
 - **Memory.** Metadata is held in memory for the duration of one comparison; the working set stays proportional to the metadata size, with no duplication of the raw reader output.
@@ -806,20 +983,22 @@ Additional required regression cases:
 
 ## 10. Testing requirements
 
-1. **Unit tests of the comparer** against a fake `IMetadataProvider`, covering every row of the table in §7 plus the listed regression cases. These require no SQL Server instance and must run in CI.
+1. **Unit tests of the comparer** against a fake `IMetadataProvider`, covering every row of the table in §7 plus the listed regression cases. These require no SQL Server instance and must run in CI. One of them covers the pairing obligation of §6.1 step 5: with a fake returning a distinguishable options object per side, assert that every metadata call received the object belonging to its own connection string.
 2. **Golden-file tests** asserting the exact serialized JSON for a representative scenario, protecting the report contract against accidental change.
-3. **Integration tests of `MsSqlMetadataProvider`** against a real MS SQL Server instance (LocalDB or a container), created from a pair of setup scripts that materialize the eight use cases.
+3. **Integration tests of `MsSqlMetadataProvider`** against a real MS SQL Server instance (LocalDB or a container), created from a pair of setup scripts that materialize the eight use cases. `GetDatabaseOptionsAsync` gets its own case: the returned object is an `MsSqlDatabaseOptions`, its `Collation` matches `DATABASEPROPERTYEX(DB_NAME(), 'Collation')`, and its `SupportsLedgerTables` matches whether the instance is SQL Server 2022 or later — or Azure SQL Database, which reports `true` at major version `12` and is the case a version check would get wrong. Two argument cases go with it: a metadata call handed a plain `DatabaseOptions` throws `ArgumentException`, and one handed `null` throws `ArgumentNullException`, both before a connection is opened.
 4. **Cancellation tests** verifying that a token cancelled mid-comparison propagates `OperationCanceledException`.
 5. **Comparer-resolution tests** — `MsSqlNameComparerResolver` over a table of `CollationInfo` values covering case-sensitive, case-insensitive, accent-insensitive, width-insensitive and binary collations, asserting for each which pairs of identifiers the returned comparer treats as equal; an unknown `Lcid` and an unknown `ComparisonStyle` bit raising `NotSupportedException`; two databases whose `CollationInfo` differs — by name and by `Version` alone — raising `CollationMismatchException` before any table metadata is read; a case-sensitive fixture holding two tables that differ only in case; and exclusion matching under both a case-sensitive and a case-insensitive comparer.
-6. **`TableIdentity.Parse` / `TryParse` tests** covering each branch of the grammar: plain two-part names, bracket-quoted parts, a dot inside brackets, an escaped `]]`, a missing dot, an empty part, unbalanced brackets, an ambiguous unquoted name with two dots, and `null` — asserting that `Parse` throws where `TryParse` returns `false`.
-7. **Credential-masking tests** covering SQL authentication, integrated security, a `PWD` alias, and a malformed connection string — asserting in each case that the real password appears neither in the result members nor in the serialized JSON, and that a supplied password is reported as `***` while integrated security gains no password keyword.
-8. **Shadow-table filtering tests** for the exclusion of §1.3, run as integration tests against a real instance, since the filter lives in the provider's SQL and a fake `IMetadataProvider` cannot exercise it. The fixtures must cover:
+6. **`MsSqlMetadataQueryBuilder` tests** — plain unit tests over returned strings, needing no database at all. This is what makes the ledger branch testable in CI: the only alternative to asserting on the text is standing up two differently-versioned servers and watching for a parse error. For each of the four methods assert: with `SupportsLedgerTables = true` the text contains both `ledger_type` and `is_dropped_ledger_table`; with `false` it contains **neither identifier anywhere** — a substring assertion over the whole statement, not an assertion about predicate shape, since the point is that the column is never *named* (§3.4.3); `temporal_type <> 1` is present in both; the projection is identical between the two variants; the same options yield the same string across calls; and `null` throws `ArgumentNullException`.
+7. **`TableIdentity.Parse` / `TryParse` tests** covering each branch of the grammar: plain two-part names, bracket-quoted parts, a dot inside brackets, an escaped `]]`, a missing dot, an empty part, unbalanced brackets, an ambiguous unquoted name with two dots, and `null` — asserting that `Parse` throws where `TryParse` returns `false`.
+8. **Credential-masking tests** covering SQL authentication, integrated security, a `PWD` alias, and a malformed connection string — asserting in each case that the real password appears neither in the result members nor in the serialized JSON, and that a supplied password is reported as `***` while integrated security gains no password keyword.
+9. **Shadow-table filtering tests** for the exclusion of §1.3, run as integration tests against a real instance, since the filter lives in the provider's SQL and a fake `IMetadataProvider` cannot exercise it. The fixtures must cover:
    - **The auto-named case, which is the reason the filter exists.** Two databases each carrying a system-versioned `dbo.Orders` declared with `WITH (SYSTEM_VERSIONING = ON)` — no `HISTORY_TABLE` clause, so each server mints its own `MSSQL_TemporalHistoryFor_<object_id>`. The two names must differ (assert this in the fixture itself, otherwise the test is vacuous), and the comparison must still yield an **empty `difference.structure`** with every section present. Without the filter this case produces two spurious `tables.ignored` entries and two spurious `missings.*.tables` entries, so it is the regression this test guards.
    - **The explicitly named case.** `WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = dbo.OrdersHistory))` on both sides: `dbo.OrdersHistory` is absent from `tables.detected` even though its name is identical on the two sides and it would otherwise have compared cleanly. The filter keys on `temporal_type`, not on the name.
    - **The period columns are still compared.** `dbo.Orders` system-versioned on the left and a plain table with the same business columns on the right: `ValidFrom` and `ValidTo` appear in `missings.right.fields`. This is what makes the exclusion lossless, and it must hold whether or not the columns are declared `HIDDEN` — `sys.columns` reports them either way.
    - **The filter releases the table when versioning ends.** After `ALTER TABLE dbo.Orders SET (SYSTEM_VERSIONING = OFF)`, the former history table is an ordinary user table and must reappear in `tables.detected` and be compared normally.
    - **Ledger, on SQL Server 2022 and later.** An updatable ledger table's history table and the remains of a dropped ledger table are both absent from `tables.detected`; the four generated `ledger_*` columns of the ledger table itself are compared as ordinary fields. These cases are skipped — not failed — when the instance under test predates SQL Server 2022, gated on the same `COL_LENGTH` probe the provider uses, so the suite stays green on a 2016–2019 instance.
-   - **The capability probe itself.** Against a pre-2022 instance, all four metadata statements execute without a parse error and the temporal cases above still pass; against a 2022+ instance the ledger predicates are in force. Assert on both instances that the run still costs exactly five queries per database (§9), so that the self-composing batch has not silently become a second round trip.
+   - **The capability read itself.** Against a pre-2022 instance, `SupportsLedgerTables` is `false`, all four metadata statements execute without a parse error, and the temporal cases above still pass; against a 2022+ instance it is `true` and the ledger predicates are in force. Assert on both instances that the run still costs exactly five queries per database (§9), so that reading the capability up front has not added a round trip of its own.
+   - **Mixed versions across the two sides.** A pre-2022 database on one side and a 2022+ database on the other, structurally identical, must compare cleanly: the run does not fail, each side receives the query variant its own `SupportsLedgerTables` calls for, and `difference.structure` is empty. This is the case that catches a shared options object being passed to both sides. Skipped when the suite has only one server version available.
 
 ---
 
@@ -835,8 +1014,10 @@ The points below are not fully determined by the source requirements. The stated
 ## 12. Definition of done
 
 - `Diff.Structure.dll` targets .NET 10 and builds with no warnings under `TreatWarningsAsErrors`.
-- The public API matches §3 exactly, including the required names `TableStructureComparer`, `CompareTableStructureAsync`, `TableStructureComparisonOptions`, `TableStructureComparisonResult`, `IMetadataProvider`, `MsSqlMetadataProvider`, and the `ToJson` extension declared by `ObjectExtensions` in `ObjectExtensions.cs`.
-- `TableStructureComparer` contains no ADO.NET references.
+- The public API matches §3 exactly, including the required names `TableStructureComparer`, `CompareTableStructureAsync`, `TableStructureComparisonOptions`, `TableStructureComparisonResult`, `IMetadataProvider`, `GetDatabaseOptionsAsync`, `DatabaseOptions`, `MsSqlDatabaseOptions`, `MsSqlMetadataProvider`, `MsSqlMetadataQueryBuilder`, and the `ToJson` extension declared by `ObjectExtensions` in `ObjectExtensions.cs`. `IMetadataProvider` declares exactly the five methods of §3.3.1 and no others; the collation is reachable only as `DatabaseOptions.Collation`, and no member of any type returns a `CollationInfo` straight from a database.
+- `TableStructureComparer` contains no ADO.NET references and no SQL of any kind. It never names `MsSqlMetadataQueryBuilder`, never names `MsSqlDatabaseOptions`, and never downcasts a `DatabaseOptions`.
+- `MsSqlMetadataProvider` contains no dynamic SQL: it composes no statement text and calls no `sys.sp_executesql`. Its only SQL literal is the database-options statement of §3.4.1; the other four statements come from `MsSqlMetadataQueryBuilder`.
+- `MsSqlMetadataQueryBuilder` names neither `ledger_type` nor `is_dropped_ledger_table` in any string it returns when `SupportsLedgerTables` is `false`, and names both when it is `true`, verified by unit tests that require no database.
 - Identifier comparison follows the comparer `INameComparerResolver` builds from the databases' `CollationInfo`, honouring its case, accent, kana and width rules; two sides whose collations differ fail the call with `CollationMismatchException` instead of producing a report.
 - Neither `TableStructureComparisonResult` nor its serialized JSON contains a plaintext password in any supported authentication mode; a supplied password is reported as `***`.
 - All eight use cases of §7, plus the listed regression cases, pass as automated tests.
