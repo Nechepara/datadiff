@@ -265,7 +265,7 @@ var dbo = new SchemaIdentity("dbo", QuotesUsage.DoNotUseIfPossible, QuoteInfo.Ms
 var orders = new TableIdentity(dbo, "Orders");
 options.ConflictResolution.Ignore(orders, From.Left);   // From.Right for the other side
 
-// 1.2 — exclude a table both databases hold and neither should have compared.
+// 1.2 — exclude a table both databases hold but that neither side should compare.
 options.ConflictResolution.Ignore(orders);              // the two entries of 1.1 at once
 
 // 2 — the table is named differently on the two sides but is one table.

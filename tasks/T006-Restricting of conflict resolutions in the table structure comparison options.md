@@ -34,7 +34,7 @@ var orders = new TableIdentity(dbo, "Orders");
 options.ConflictResolution.Ignore(orders, From.Left); //use From.Right to exclude the specified table for the `Right` database
 ```
 ## Sample 1.2: Force table ignoring (excluding the table from comparison for both databases)
-Lets the table `dbo.Orders` exists in the both databases, but should be excluded from comparison. The following sample shows how to exclude the table`dbo.Orders` which exists in the `Left` database only.
+Lets the table `dbo.Orders` exists in the both databases, but should be excluded from comparison. The following sample shows how to exclude the table`dbo.Orders` which exists in both databases.
 ```csharp
 var options = new TableStructureComparisonOptions();
 var dbo = new SchemaIdentity("dbo", QuotesUsage.DoNotUseIfPossible, QuoteInfo.MsSql);
