@@ -1,0 +1,506 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "table-structure-comparison-result.json",
+  "title": "TableStructureComparisonResult",
+  "description": "The JSON report produced by Diff.Structure.dll, as specified in brief.md §4 (Result model), §5 (Report structure) and §5.1 (Rules that govern the report). Every section is always present: empty collections serialize as [] and empty objects as {}, so a consumer never has to null-check a section. A null scalar is never emitted — a property that carries no value is absent from the document altogether, the empty side of a conflictResolution element included.",
+  "type": "object",
+  "required": ["left", "right", "collation", "conflictResolution", "tables", "difference"],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "Not part of the report. A sample document may carry this property to point an editor or validator at this schema; a report produced by the library never emits it. It is allowed here only so that such a sample still validates against a root that is otherwise closed."
+    },
+    "left": {
+      "$ref": "#/$defs/maskedConnectionString",
+      "description": "The connection string to the first DB, with the password value replaced by ***."
+    },
+    "right": {
+      "$ref": "#/$defs/maskedConnectionString",
+      "description": "The connection string to the second DB, with the password value replaced by ***."
+    },
+    "collation": { "$ref": "#/$defs/collation" },
+    "conflictResolution": { "$ref": "#/$defs/conflictResolutionList" },
+    "tables": { "$ref": "#/$defs/tables" },
+    "difference": { "$ref": "#/$defs/difference" }
+  },
+
+  "$defs": {
+    "maskedConnectionString": {
+      "type": "string",
+      "minLength": 1,
+      "description": "§6.6 — no plaintext password ever reaches the report. A supplied password is reported as ***; integrated security gains no password keyword."
+    },
+
+    "tableName": {
+      "type": "string",
+      "minLength": 3,
+      "pattern": "^.+\\..+$",
+      "description": "A two-part table name, schema and table separated by a '.', rendered from PreferredName (§5.1 Identifier form). An identifier that needs no quoting appears bare (dbo.Orders); one that does appears quoted ([dbo].[Order.Archive]). A one-part name such as 'Orders' is invalid."
+    },
+
+    "fieldName": {
+      "type": "string",
+      "minLength": 1,
+      "description": "An unqualified field name, rendered from PreferredName."
+    },
+
+    "conflictResolutionId": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "description": "§4 — a ConflictResolution.Id in the default Guid form: 36 lowercase characters, hyphenated. Random, generated when the entry is built."
+    },
+
+    "conflictResolutionReference": {
+      "type": "object",
+      "description": "§5.1 References to the conflict resolutions — written in place of a table or field name whose identity in this run was settled by a ConflictResolution entry. The id is that of exactly one element of the root 'conflictResolution' list, whose 'kind' matches the slot (a table slot refers to a 'table' element, a field slot to a 'field' element). That cross-reference cannot be expressed in JSON Schema and is asserted by the tests instead.",
+      "required": ["conflictResolution"],
+      "additionalProperties": false,
+      "properties": {
+        "conflictResolution": { "$ref": "#/$defs/conflictResolutionId" }
+      }
+    },
+
+    "tableSlot": {
+      "description": "A table slot of 'tables.ignored' or 'difference': the table's two-part name, or a reference to the Map entry that bound it into a forced pair. A consumer tells the two apart by JSON type — a string is a name, an object is a reference.",
+      "oneOf": [
+        { "$ref": "#/$defs/tableName" },
+        { "$ref": "#/$defs/conflictResolutionReference" }
+      ]
+    },
+
+    "fieldSlot": {
+      "description": "A field slot of 'difference' — a 'field', a 'referencedField', or an item of a primary key's 'fields': the field's name, or a reference to the Map entry that bound it into a forced pair.",
+      "oneOf": [
+        { "$ref": "#/$defs/fieldName" },
+        { "$ref": "#/$defs/conflictResolutionReference" }
+      ]
+    },
+
+    "conflictResolutionList": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/conflictResolutionElement" },
+      "description": "§5.1 The conflictResolution section — every entry of the ConflictResolution snapshot the run validated, applied or not; [] when the caller supplied none. Ordered by 'kind' (table before field), then by the left side, then by the right side, an absent side sorting first; 'id' never participates in the order. Ids are unique within the list — not expressible in JSON Schema, asserted by the tests."
+    },
+
+    "conflictResolutionElement": {
+      "type": "object",
+      "description": "One ConflictResolution entry. 'id', 'owner', 'kind' and 'action' are written on every element; 'left' and 'right' only when the entry names an object on that side — the side a skip entry leaves empty is absent, never null, like every property of the report that carries no value. A side is rendered like the same object anywhere else in the report: a table two-part, a field by its unqualified name. No member of an element is ever a reference: references point at these elements, never from one to another.",
+      "required": ["id", "owner", "kind", "action"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "$ref": "#/$defs/conflictResolutionId" },
+        "owner": { "$ref": "#/$defs/conflictResolutionOwner" },
+        "left": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The name of the object the entry's Left names. Absent when Left is null."
+        },
+        "right": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The name of the object the entry's Right names. Absent when Right is null."
+        },
+        "kind": {
+          "enum": ["table", "field"],
+          "description": "ObjectKind, as a lowercase literal. No entry carries a key kind."
+        },
+        "action": {
+          "enum": ["skip", "map"],
+          "description": "ConflictResolutionAction, as a lowercase literal: skip exactly when one side is absent, map when both are present."
+        }
+      },
+      "allOf": [
+        {
+          "$comment": "A skip entry names exactly one side and is always a table exclusion; its owner names that same side and no other.",
+          "if": {
+            "properties": { "action": { "const": "skip" } },
+            "required": ["action"]
+          },
+          "then": {
+            "properties": { "kind": { "const": "table" } },
+            "oneOf": [
+              {
+                "required": ["left"],
+                "not": { "required": ["right"] },
+                "properties": { "owner": { "required": ["left"], "not": { "required": ["right"] } } }
+              },
+              {
+                "required": ["right"],
+                "not": { "required": ["left"] },
+                "properties": { "owner": { "required": ["right"], "not": { "required": ["left"] } } }
+              }
+            ]
+          }
+        },
+        {
+          "$comment": "A map entry names both sides, and so does its owner.",
+          "if": {
+            "properties": { "action": { "const": "map" } },
+            "required": ["action"]
+          },
+          "then": {
+            "required": ["left", "right"],
+            "properties": { "owner": { "required": ["left", "right"] } }
+          }
+        },
+        {
+          "$comment": "A table element: each side is two-part, as tableName requires, and each side of owner is that side's schema.",
+          "if": {
+            "properties": { "kind": { "const": "table" } },
+            "required": ["kind"]
+          },
+          "then": {
+            "properties": {
+              "left": { "$ref": "#/$defs/tableName" },
+              "right": { "$ref": "#/$defs/tableName" },
+              "owner": {
+                "properties": {
+                  "left": { "$ref": "#/$defs/schemaName" },
+                  "right": { "$ref": "#/$defs/schemaName" }
+                }
+              }
+            }
+          }
+        },
+        {
+          "$comment": "A field element: each side is an unqualified field name, and each side of owner is the two-part name of that side's table.",
+          "if": {
+            "properties": { "kind": { "const": "field" } },
+            "required": ["kind"]
+          },
+          "then": {
+            "properties": {
+              "owner": {
+                "properties": {
+                  "left": { "$ref": "#/$defs/tableName" },
+                  "right": { "$ref": "#/$defs/tableName" }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+
+    "conflictResolutionOwner": {
+      "type": "object",
+      "description": "§5.1 — what the objects named by the element's 'left' and 'right' belong to, written per side: the schema of each side's table for a table element, the two-part name of each side's table for a field element — a plain name even when the two tables are themselves paired by a map entry, never a reference. A side is present exactly when the element's own 'left' or 'right' is, which the element's rules enforce.",
+      "minProperties": 1,
+      "additionalProperties": false,
+      "properties": {
+        "left": { "type": "string", "minLength": 1 },
+        "right": { "type": "string", "minLength": 1 }
+      }
+    },
+
+    "schemaName": {
+      "type": "string",
+      "minLength": 1,
+      "description": "An unqualified schema name, rendered from PreferredName."
+    },
+
+    "keyName": {
+      "type": "string",
+      "minLength": 1,
+      "description": "An unqualified primary- or foreign-key name, rendered from PreferredName."
+    },
+
+    "collation": {
+      "type": "object",
+      "description": "§5.1 — always present and always complete. The four numeric members are JSON numbers rather than strings, and a 0 among them is a value and not a missing one.",
+      "required": ["name", "lcid", "codePage", "comparisonStyle", "version"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "lcid": { "type": "integer" },
+        "codePage": { "type": "integer" },
+        "comparisonStyle": { "type": "integer" },
+        "version": { "type": "integer" }
+      }
+    },
+
+    "tables": {
+      "type": "object",
+      "required": ["detected", "ignored"],
+      "additionalProperties": false,
+      "properties": {
+        "detected": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/tableName" },
+          "description": "The distinct union of the table names fetched from both databases, the ignored ones included (§6.2 step 6). Plain names only, never references: a forced pair contributes one entry, in the left database's spelling. Sorted ascending with StringComparer.Ordinal."
+        },
+        "ignored": {
+          "type": "object",
+          "description": "§5.1 — the report's only record of a table that was fetched and then not compared; every entry is one of the caller's Ignore entries applied to one table, since the library never leaves a table out on its own. Indexed by side: an entry is recorded under the side whose database holds the table it describes, so one name appearing in both lists is normal rather than a duplicate. The comparison set is detected − ignored.left − ignored.right, and no table appears both here and in missings.*.tables.",
+          "required": ["left", "right"],
+          "additionalProperties": false,
+          "properties": {
+            "left": { "$ref": "#/$defs/ignoredTableList" },
+            "right": { "$ref": "#/$defs/ignoredTableList" }
+          }
+        }
+      }
+    },
+
+    "ignoredTableList": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/ignoredTable" },
+      "description": "§4 — sorted ascending with StringComparer.Ordinal by the name each entry's reference stands for, never by the identifier; 'reason' never participates in the ordering. A table contributes at most one entry per side."
+    },
+
+    "ignoredTable": {
+      "type": "object",
+      "description": "§5.1 Shape of an `ignored` entry — one table of this side that the caller excluded with Ignore. Both properties are written on every entry. There is no property saying who excluded the table: only the caller can, so it would carry no information. An ignored table never has a missings.*.tables counterpart.",
+      "required": ["table", "reason"],
+      "additionalProperties": false,
+      "properties": {
+        "table": {
+          "$ref": "#/$defs/conflictResolutionReference",
+          "description": "Always a reference to the skip element of 'conflictResolution' that excluded the table, and to an element whose own side is set: an entry of ignored.left refers to one whose 'left' is set, an entry of ignored.right to one whose 'right' is set."
+        },
+        "reason": {
+          "const": "The table was skipped at the user's request.",
+          "description": "A fixed literal, never composed per table. Part of the report contract: the punctuation and capitalization are normative."
+        }
+      }
+    },
+
+    "difference": {
+      "type": "object",
+      "required": ["structure"],
+      "additionalProperties": false,
+      "properties": {
+        "structure": {
+          "type": "object",
+          "required": ["missings", "inconsistencies"],
+          "additionalProperties": false,
+          "properties": {
+            "missings": { "$ref": "#/$defs/missings" },
+            "inconsistencies": { "$ref": "#/$defs/inconsistencies" }
+          }
+        }
+      }
+    },
+
+    "missings": {
+      "type": "object",
+      "description": "§5.1 — missings.left lists objects absent in the LEFT database but present in the right one; missings.right is the mirror image. Both sides have exactly the same shape.",
+      "required": ["left", "right"],
+      "additionalProperties": false,
+      "properties": {
+        "left": { "$ref": "#/$defs/missingsSide" },
+        "right": { "$ref": "#/$defs/missingsSide" }
+      }
+    },
+
+    "missingsSide": {
+      "type": "object",
+      "required": ["tables", "fields", "primaryKeys", "foreignKeys"],
+      "additionalProperties": false,
+      "properties": {
+        "tables": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/tableSlot" },
+          "description": "Tables missing in this side's database but present in the other one. The fields and keys of such a table are not additionally listed below. Every one-sided table the caller did not exclude is listed here, since the library never ignores a table on its own. uniqueItems compares whole items, so two references with the same id also count as duplicates."
+        },
+        "fields": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/missingField" }
+        },
+        "primaryKeys": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/missingPrimaryKey" }
+        },
+        "foreignKeys": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/missingForeignKey" }
+        }
+      }
+    },
+
+    "missingField": {
+      "type": "object",
+      "required": ["field", "table"],
+      "additionalProperties": false,
+      "properties": {
+        "field": { "$ref": "#/$defs/fieldSlot" },
+        "table": { "$ref": "#/$defs/tableSlot" }
+      }
+    },
+
+    "missingPrimaryKey": {
+      "type": "object",
+      "description": "§6.4 — 'key' and 'fields' carry the primary key found in the OTHER database. When the table has no primary key in either database (Use Case 7) the entry contains only 'table', and both properties are absent rather than null. They are therefore present together or not at all.",
+      "required": ["table"],
+      "additionalProperties": false,
+      "dependentRequired": {
+        "key": ["fields"],
+        "fields": ["key"]
+      },
+      "properties": {
+        "table": { "$ref": "#/$defs/tableSlot" },
+        "key": { "$ref": "#/$defs/keyName" },
+        "fields": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/fieldSlot" }
+        }
+      }
+    },
+
+    "missingForeignKey": {
+      "type": "object",
+      "description": "§6.5 step 4 — reported with key, table, referencedTable and the full fields list.",
+      "required": ["key", "table", "referencedTable", "fields"],
+      "additionalProperties": false,
+      "properties": {
+        "key": { "$ref": "#/$defs/keyName" },
+        "table": { "$ref": "#/$defs/tableSlot" },
+        "referencedTable": { "$ref": "#/$defs/tableSlot" },
+        "fields": { "$ref": "#/$defs/foreignKeyColumns" }
+      }
+    },
+
+    "foreignKeyColumns": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["field", "referencedField"],
+        "additionalProperties": false,
+        "properties": {
+          "field": { "$ref": "#/$defs/fieldSlot" },
+          "referencedField": { "$ref": "#/$defs/fieldSlot" }
+        }
+      }
+    },
+
+    "inconsistencies": {
+      "type": "object",
+      "description": "§5.1 — all three sections share one uniform shape: the properties common to both sides live in the array element itself, and the two compared sides are nested in an 'inconsistency' property with 'left' and 'right' nodes. Every table and field slot, in the element and in both descriptors, is a name or a reference to the Map entry that bound the object (tableSlot, fieldSlot).",
+      "required": ["fields", "primaryKeys", "foreignKeys"],
+      "additionalProperties": false,
+      "properties": {
+        "fields": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/fieldInconsistency" }
+        },
+        "primaryKeys": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/primaryKeyInconsistency" }
+        },
+        "foreignKeys": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/foreignKeyInconsistency" }
+        }
+      }
+    },
+
+    "fieldInconsistency": {
+      "type": "object",
+      "required": ["field", "table", "inconsistency"],
+      "additionalProperties": false,
+      "properties": {
+        "field": { "$ref": "#/$defs/fieldSlot" },
+        "table": { "$ref": "#/$defs/tableSlot" },
+        "inconsistency": {
+          "type": "object",
+          "required": ["left", "right"],
+          "additionalProperties": false,
+          "properties": {
+            "left": { "$ref": "#/$defs/fieldDescriptor" },
+            "right": { "$ref": "#/$defs/fieldDescriptor" }
+          }
+        }
+      }
+    },
+
+    "fieldDescriptor": {
+      "type": "object",
+      "description": "§4 — 'size', 'precision' and 'scale' are written only when they carry a value; when the metadata has none the property is absent from the JSON altogether rather than present with a null value. A nvarchar field emits type, size and nullable and nothing else; a decimal field emits type, nullable, precision and scale.",
+      "required": ["type", "nullable"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The data type name, as the server reports it."
+        },
+        "nullable": { "type": "boolean" },
+        "size": {
+          "type": "integer",
+          "minimum": -1,
+          "description": "Length in characters (for the Unicode types) or bytes; -1 means MAX. Absent when not applicable."
+        },
+        "precision": { "type": "integer", "minimum": 0 },
+        "scale": { "type": "integer", "minimum": 0 }
+      }
+    },
+
+    "primaryKeyInconsistency": {
+      "type": "object",
+      "description": "§6.4 — raised by a differing field set, never by a differing key name. Both key names are carried for reference only.",
+      "required": ["table", "inconsistency"],
+      "additionalProperties": false,
+      "properties": {
+        "table": { "$ref": "#/$defs/tableSlot" },
+        "inconsistency": {
+          "type": "object",
+          "required": ["left", "right"],
+          "additionalProperties": false,
+          "properties": {
+            "left": { "$ref": "#/$defs/primaryKeyDescriptor" },
+            "right": { "$ref": "#/$defs/primaryKeyDescriptor" }
+          }
+        }
+      }
+    },
+
+    "primaryKeyDescriptor": {
+      "type": "object",
+      "required": ["key", "fields"],
+      "additionalProperties": false,
+      "properties": {
+        "key": { "$ref": "#/$defs/keyName" },
+        "fields": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/fieldSlot" }
+        }
+      }
+    },
+
+    "foreignKeyInconsistency": {
+      "type": "object",
+      "description": "§6.5 — foreign keys are grouped by the pair (table, referencedTable); an entry pairs one left key with one right key.",
+      "required": ["table", "referencedTable", "inconsistency"],
+      "additionalProperties": false,
+      "properties": {
+        "table": { "$ref": "#/$defs/tableSlot" },
+        "referencedTable": { "$ref": "#/$defs/tableSlot" },
+        "inconsistency": {
+          "type": "object",
+          "required": ["left", "right"],
+          "additionalProperties": false,
+          "properties": {
+            "left": { "$ref": "#/$defs/foreignKeyDescriptor" },
+            "right": { "$ref": "#/$defs/foreignKeyDescriptor" }
+          }
+        }
+      }
+    },
+
+    "foreignKeyDescriptor": {
+      "type": "object",
+      "required": ["key", "fields"],
+      "additionalProperties": false,
+      "properties": {
+        "key": { "$ref": "#/$defs/keyName" },
+        "fields": { "$ref": "#/$defs/foreignKeyColumns" }
+      }
+    }
+  }
+}
