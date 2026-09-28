@@ -226,14 +226,18 @@
       "additionalProperties": false,
       "properties": {
         "detected": {
-          "type": "array",
-          "uniqueItems": true,
-          "items": { "$ref": "#/$defs/tableName" },
-          "description": "The distinct union of the table names fetched from both databases, the ignored ones included (§6.2 step 6). Plain names only, never references: a forced pair contributes one entry, in the left database's spelling. Sorted ascending with StringComparer.Ordinal."
+          "type": "object",
+          "description": "§5.1 Shape of `detected` — the table names fetched from each database, kept per side so that a name never loses the database it came from (§6.2 step 6). Nothing is merged across the sides: a table both databases hold appears in both lists, and a forced pair contributes its left member to 'left' and its right member to 'right', each in its own database's spelling.",
+          "required": ["left", "right"],
+          "additionalProperties": false,
+          "properties": {
+            "left": { "$ref": "#/$defs/detectedTableList" },
+            "right": { "$ref": "#/$defs/detectedTableList" }
+          }
         },
         "ignored": {
           "type": "object",
-          "description": "§5.1 — the report's only record of a table that was fetched and then not compared; every entry is one of the caller's Ignore entries applied to one table, since the library never leaves a table out on its own. Indexed by side: an entry is recorded under the side whose database holds the table it describes, so one name appearing in both lists is normal rather than a duplicate. The comparison set is detected − ignored.left − ignored.right, and no table appears both here and in missings.*.tables.",
+          "description": "§5.1 — the report's only record of a table that was fetched and then not compared; every entry is one of the caller's Ignore entries applied to one table, since the library never leaves a table out on its own. Indexed by side: an entry is recorded under the side whose database holds the table it describes, so one name appearing in both lists is normal rather than a duplicate. Every entry of ignored.left names a table of detected.left, and every entry of ignored.right a table of detected.right. The comparison set is detected.left − ignored.left matched against detected.right − ignored.right, and no table appears both here and in missings.*.tables.",
           "required": ["left", "right"],
           "additionalProperties": false,
           "properties": {
@@ -242,6 +246,13 @@
           }
         }
       }
+    },
+
+    "detectedTableList": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/tableName" },
+      "description": "§5.1 — every table one database returned, the ignored, forced-paired and one-sided ones included, as the plain two-part names that database holds; never references. Distinct because they are one database's own names. [] when the database holds no table. Sorted ascending with StringComparer.Ordinal."
     },
 
     "ignoredTableList": {
